@@ -78,6 +78,11 @@ class UnifiedInferencePipeline:
         
         self.diffusion = diffusion
         
+        # Extract model dimensions from DiT
+        self.latent_dim = getattr(dit_model, 'latent_dim', 512)
+        self.num_patches = getattr(dit_model, 'num_patches', 256)
+        self.num_frames = getattr(dit_model, 'num_frames', 16)
+        
         # Freeze all models
         for model in [self.vggt, self.autoencoder, self.dit]:
             for param in model.parameters():
@@ -307,7 +312,9 @@ class UnifiedInferencePipeline:
         
         # Reconstruct aggregated_tokens_list format
         B, S, P, C = layer_features[0].shape
-        patch_start_idx = self.vggt.aggregator.patch_start_idx
+        
+        # Get patch_start_idx safely with default
+        patch_start_idx = getattr(self.vggt.aggregator, 'patch_start_idx', 5)
         
         # Create dummy special tokens
         dummy_special = torch.zeros(B, S, patch_start_idx, C, device=z.device)
@@ -359,11 +366,9 @@ class UnifiedInferencePipeline:
         if config.seed is not None:
             torch.manual_seed(config.seed)
         
-        # Determine shape
-        num_patches = 256  # After spatial downsampling
-        latent_dim = 512
-        
-        shape = (batch_size, config.num_frames, num_patches, latent_dim)
+        # Determine shape from model config
+        num_frames = config.num_frames if config.num_frames else self.num_frames
+        shape = (batch_size, num_frames, self.num_patches, self.latent_dim)
         
         # Sample using diffusion
         z = self.diffusion.ddim_sample_loop(
@@ -389,9 +394,13 @@ class UnifiedInferencePipeline:
         
         This is the main generation function for Phase 3.
         
+        Note: Text prompt conditioning requires LLM integration, which is not
+        yet fully implemented. Currently, the prompt parameter is ignored and
+        generation is unconditional.
+        
         Args:
             image: Input image (single image or sparse images)
-            prompt: Optional text prompt for generation
+            prompt: Optional text prompt for generation (not yet fully supported)
             config: Generation configuration
             
         Returns:
@@ -411,27 +420,25 @@ class UnifiedInferencePipeline:
         visual_features = self.extract_visual_features(images)
         
         # Check if we have LLM for text conditioning
+        # Note: Full LLM integration is a future enhancement
         condition_tokens = None
         if self.llm is not None and prompt is not None:
-            # This would involve:
-            # 1. Tokenize prompt
-            # 2. Get visual tokens from resampler
-            # 3. Combine and run through LLM
-            # 4. Extract condition tokens
-            # For now, use unconditional generation
-            pass
+            import warnings
+            warnings.warn(
+                "Text prompt conditioning is not yet fully implemented. "
+                "The prompt will be ignored and generation will be unconditional.",
+                UserWarning
+            )
         
-        # Generate latent
-        num_patches = 256
-        latent_dim = 512
-        shape = (B, config.num_frames, num_patches, latent_dim)
+        # Determine shape from model config
+        num_frames = config.num_frames if config.num_frames else self.num_frames
+        shape = (B, num_frames, self.num_patches, self.latent_dim)
         
-        def denoise_fn(x, t):
-            return self.dit(x, t, condition=condition_tokens)
-        
+        # Sample using diffusion with the DiT model
         z = self.diffusion.ddim_sample_loop(
-            denoise_fn,
+            self.dit,
             shape,
+            condition=condition_tokens,
             num_steps=config.num_diffusion_steps,
             eta=config.eta,
             device=self.device,
@@ -440,7 +447,7 @@ class UnifiedInferencePipeline:
         
         # Create reference images for depth decoding
         # Expand input image to match generated frames
-        reference_images = images[:, 0:1].expand(-1, config.num_frames, -1, -1, -1)
+        reference_images = images[:, 0:1].expand(-1, num_frames, -1, -1, -1)
         
         # Decode to depth
         depth_outputs = self.decode_to_depth(z, reference_images)

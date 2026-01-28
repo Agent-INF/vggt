@@ -582,16 +582,14 @@ class Unified3DModel(nn.Module):
             llm_hidden_states, num_frames
         )
         
-        # Define denoising function
-        def denoise_fn(x, t):
-            return self.llm_dit_wrapper.forward_dit(x, t, condition_tokens)
-        
-        # Sample from diffusion
+        # Sample from diffusion with condition tokens
         shape = (B, num_frames, self.llm_dit_wrapper.num_patches, 
                  self.llm_dit_wrapper.latent_dim)
         
         generated_z = self.diffusion.ddim_sample_loop(
-            denoise_fn, shape,
+            self.llm_dit_wrapper.dit, 
+            shape,
+            condition=condition_tokens,
             num_steps=num_steps,
             progress=True,
         )
@@ -624,7 +622,9 @@ class Unified3DModel(nn.Module):
         # This is a simplified version - in practice, you may need to handle
         # the full 24-layer structure
         B, S, P, C = layer_features[0].shape
-        patch_start_idx = self.vggt.aggregator.patch_start_idx
+        
+        # Get patch_start_idx safely with default
+        patch_start_idx = getattr(self.vggt.aggregator, 'patch_start_idx', 5)
         
         # Create dummy camera/register tokens
         dummy_special = torch.zeros(B, S, patch_start_idx, C, device=z.device)

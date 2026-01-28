@@ -87,9 +87,10 @@ class VGGTFeatureExtractor:
     
     def _setup_normalization(self):
         """Set up image normalization constants."""
-        self.register_buffer = lambda name, tensor: setattr(self, name, tensor)
-        self.mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1).to(self.device)
-        self.std = torch.tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1).to(self.device)
+        # Store normalization tensors as regular attributes (not buffers since we're not nn.Module)
+        # Shape [1, 3, 1, 1] for proper broadcasting with [B*S, C, H, W] images
+        self.mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(self.device)
+        self.std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(self.device)
     
     @torch.no_grad()
     def extract_dino_features(
@@ -108,12 +109,12 @@ class VGGTFeatureExtractor:
         B, S, C, H, W = images.shape
         images = images.to(self.device)
         
-        # Normalize
-        images_norm = (images - self.mean) / self.std
-        images_flat = images_norm.view(B * S, C, H, W)
+        # Reshape to [B*S, C, H, W] first, then normalize
+        images_flat = images.view(B * S, C, H, W)
+        images_norm = (images_flat - self.mean) / self.std
         
         # Get patch tokens
-        patch_tokens = self.vggt.aggregator.patch_embed(images_flat)
+        patch_tokens = self.vggt.aggregator.patch_embed(images_norm)
         if isinstance(patch_tokens, dict):
             patch_tokens = patch_tokens["x_norm_patchtokens"]
         
@@ -236,9 +237,10 @@ class VGGTFeatureExtractor:
         
         # Extract depth if requested
         depth = None
-        if extract_depth and self.vggt.depth_head is not None:
+        depth_head = getattr(self.vggt, 'depth_head', None)
+        if extract_depth and depth_head is not None:
             aggregated_tokens_list, patch_start_idx = self.extract_aggregated_features(video_frames)
-            depth, depth_conf = self.vggt.depth_head(
+            depth, depth_conf = depth_head(
                 aggregated_tokens_list, video_frames, patch_start_idx
             )
             results["depth_shape"] = list(depth.shape)

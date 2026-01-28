@@ -366,22 +366,24 @@ class LatentDiT(nn.Module):
         
         # Add global condition if provided (for unconditional or simple conditioning)
         c = t_emb
+        projected_context = None  # For cross-attention
+        
         if condition is not None and self.condition_proj is not None:
             if len(condition.shape) == 2:
                 # Global condition [B, condition_dim]
                 cond_emb = self.condition_proj(condition)
                 c = c + cond_emb
+            elif len(condition.shape) == 3:
+                # Sequence condition [B, M, condition_dim] - project once for cross-attention
+                projected_context = self.condition_proj(condition)
         
         # Process through DiT blocks
         for i, block in enumerate(self.blocks):
             x = block(x, c)
             
             # Optional cross-attention with sequence condition
-            if self.cross_attn_blocks is not None and condition is not None:
-                if len(condition.shape) == 3:
-                    # Sequence condition [B, M, condition_dim]
-                    context = self.condition_proj(condition)
-                    x = self.cross_attn_blocks[i](x, context, condition_mask)
+            if self.cross_attn_blocks is not None and projected_context is not None:
+                x = self.cross_attn_blocks[i](x, projected_context, condition_mask)
         
         # Final layer
         x = self.final_layer(x, c)  # [B, N, latent_dim]
