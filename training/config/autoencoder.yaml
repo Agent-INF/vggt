@@ -1,0 +1,181 @@
+# AutoEncoder training configuration for Phase 1
+# Compresses VGGT's latent_2 features into compact latent space
+
+defaults:
+  - default_dataset.yaml
+
+exp_name: autoencoder_phase1
+img_size: 518
+num_workers: 8
+seed_value: 42
+accum_steps: 1
+patch_size: 14
+val_epoch_freq: 5
+max_img_per_gpu: 24  # Reduced due to storing full latent_2
+
+limit_train_batches: 800
+limit_val_batches: 200
+
+
+# Data configuration
+data:
+  train:
+    _target_: data.dynamic_dataloader.DynamicTorchDataset
+    num_workers: ${num_workers}
+    max_img_per_gpu: ${max_img_per_gpu}
+    common_config:
+      img_size: ${img_size}
+      patch_size: ${patch_size}
+      debug: False
+      repeat_batch: False
+      # Store latent_2 features for training
+      extract_latent2: True
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.co3d.Co3dDataset
+          split: train
+          CO3D_DIR: /YOUR/PATH/TO/CO3D
+          CO3D_ANNOTATION_DIR: /YOUR/PATH/TO/CO3D_ANNOTATION
+  val:
+    _target_: data.dynamic_dataloader.DynamicTorchDataset
+    num_workers: ${num_workers}
+    max_img_per_gpu: ${max_img_per_gpu}
+    common_config:
+      img_size: ${img_size}
+      patch_size: ${patch_size}
+      debug: False
+      extract_latent2: True
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.co3d.Co3dDataset
+          split: test
+          CO3D_DIR: /YOUR/PATH/TO/CO3D
+          CO3D_ANNOTATION_DIR: /YOUR/PATH/TO/CO3D_ANNOTATION
+
+
+logging:
+  log_dir: logs
+  log_visuals: False
+  log_freq: 1
+  log_level_primary: DEBUG
+  log_level_secondary: WARNING
+  all_ranks: False
+  tensorboard_writer:
+    _target_: train_utils.tb_writer.TensorBoardLogger
+    path: ${logging.log_dir}/tensorboard
+  scalar_keys_to_log:
+    train:
+      keys_to_log:
+        - loss_total
+        - loss_feature_recon
+        - loss_geometric
+        - loss_depth_consistency
+    val:
+      keys_to_log:
+        - loss_total
+        - loss_feature_recon
+        - loss_geometric
+        - loss_depth_consistency
+
+
+checkpoint:
+  save_dir: logs/${exp_name}/ckpts
+  save_freq: 5
+  resume_checkpoint_path: null
+  strict: False
+
+
+# AutoEncoder Loss configuration
+loss:
+  _target_: vggt.models.latent_autoencoder.AutoEncoderLoss
+  feature_weight: 1.0
+  geometric_weight: 0.5  # Weight for geometric consistency (DPT Head reconstruction)
+
+
+# Optimizer configuration
+optim:
+  param_group_modifiers: False
+
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 1e-4
+    weight_decay: 0.01
+
+  # Freeze VGGT components
+  frozen_module_names:
+    - "*vggt*"  # Freeze entire VGGT model
+    - "*dpt_head*"  # Ensure DPT Head is frozen
+
+  amp:
+    enabled: True
+    amp_dtype: bfloat16
+  
+  gradient_clip:
+    _target_: train_utils.gradient_clip.GradientClipper
+    configs:
+      - module_name: ["autoencoder"]
+        max_norm: 1.0
+        norm_type: 2
+  
+  options:
+    lr:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.CompositeParamScheduler
+          schedulers:
+            - _target_: fvcore.common.param_scheduler.LinearParamScheduler
+              start_value: 1e-6
+              end_value: 1e-4
+            - _target_: fvcore.common.param_scheduler.CosineParamScheduler
+              start_value: 1e-4
+              end_value: 1e-6
+          lengths: [0.05, 0.95]
+          interval_scaling: ['rescaled', 'rescaled']
+    weight_decay:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+          value: 0.01
+
+
+max_epochs: 50
+
+
+# Model configuration
+model:
+  # AutoEncoder model
+  autoencoder:
+    _target_: vggt.models.latent_autoencoder.LatentAutoEncoder
+    input_dim: 2048
+    num_layers: 4
+    hidden_dim: 1024
+    latent_dim: 512
+    num_encoder_blocks: 4
+    num_decoder_blocks: 4
+    num_heads: 16
+    spatial_downsample: 4
+    intermediate_layer_idx: [4, 11, 17, 23]
+  
+  # Frozen VGGT for feature extraction and geometric loss
+  vggt:
+    _target_: vggt.models.vggt.VGGT
+    enable_camera: False
+    enable_depth: True  # Enable for geometric consistency loss
+    enable_point: False
+    enable_track: False
+
+
+distributed:
+  backend: nccl
+  comms_dtype: null
+  find_unused_parameters: True  # Some VGGT params unused during AE training
+  timeout_mins: 30
+  gradient_as_bucket_view: True
+  bucket_cap_mb: 25
+  broadcast_buffers: True
+
+
+cuda:
+  cudnn_deterministic: False
+  cudnn_benchmark: False
+  allow_tf32: True

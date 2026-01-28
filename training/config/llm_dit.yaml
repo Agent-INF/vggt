@@ -1,0 +1,244 @@
+# LLM + DiT Joint Training configuration for Phase 3
+# Multimodal unified 3D generation with Qwen3 and DiT
+
+defaults:
+  - default_dataset.yaml
+
+exp_name: llm_dit_phase3
+img_size: 518
+num_workers: 8
+seed_value: 42
+accum_steps: 4  # Higher accumulation due to LLM memory
+patch_size: 14
+val_epoch_freq: 5
+max_img_per_gpu: 8  # Small batch due to LLM
+
+limit_train_batches: 500
+limit_val_batches: 100
+
+
+# Diffusion configuration
+diffusion:
+  num_timesteps: 1000
+  beta_schedule: "cosine"
+  model_mean_type: "epsilon"
+  model_var_type: "fixed_small"
+  loss_type: "mse"
+
+
+# LLM Configuration
+llm:
+  model_name: "Qwen/Qwen3-4B"  # Can also use Qwen3-7B, Qwen3-14B
+  llm_dim: 4096
+  max_seq_length: 2048
+  use_lora: True
+  lora_config:
+    r: 16
+    lora_alpha: 32
+    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
+    lora_dropout: 0.05
+
+
+# Data configuration
+data:
+  train:
+    _target_: data.dynamic_dataloader.DynamicTorchDataset
+    num_workers: ${num_workers}
+    max_img_per_gpu: ${max_img_per_gpu}
+    common_config:
+      img_size: ${img_size}
+      patch_size: ${patch_size}
+      debug: False
+      repeat_batch: False
+      # Use sparse frames as input, full video as target
+      sparse_input_frames: 2  # Use first and last frame
+      use_precomputed_latent: True
+      latent_cache_dir: /YOUR/PATH/TO/LATENT_CACHE
+      # Text prompts for training
+      use_text_prompts: True
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.co3d.Co3dDataset
+          split: train
+          CO3D_DIR: /YOUR/PATH/TO/CO3D
+          CO3D_ANNOTATION_DIR: /YOUR/PATH/TO/CO3D_ANNOTATION
+  val:
+    _target_: data.dynamic_dataloader.DynamicTorchDataset
+    num_workers: ${num_workers}
+    max_img_per_gpu: ${max_img_per_gpu}
+    common_config:
+      img_size: ${img_size}
+      patch_size: ${patch_size}
+      debug: False
+      sparse_input_frames: 2
+      use_precomputed_latent: True
+      latent_cache_dir: /YOUR/PATH/TO/LATENT_CACHE
+      use_text_prompts: True
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.co3d.Co3dDataset
+          split: test
+          CO3D_DIR: /YOUR/PATH/TO/CO3D
+          CO3D_ANNOTATION_DIR: /YOUR/PATH/TO/CO3D_ANNOTATION
+
+
+logging:
+  log_dir: logs
+  log_visuals: True
+  log_freq: 1
+  log_level_primary: DEBUG
+  log_level_secondary: WARNING
+  all_ranks: False
+  tensorboard_writer:
+    _target_: train_utils.tb_writer.TensorBoardLogger
+    path: ${logging.log_dir}/tensorboard
+  scalar_keys_to_log:
+    train:
+      keys_to_log:
+        - loss
+        - mse
+        - loss_diffusion
+    val:
+      keys_to_log:
+        - loss
+        - mse
+        - loss_diffusion
+
+
+checkpoint:
+  save_dir: logs/${exp_name}/ckpts
+  save_freq: 5
+  resume_checkpoint_path: null
+  strict: False
+
+
+# Loss configuration
+loss:
+  _target_: vggt.utils.diffusion.GaussianDiffusion
+  num_timesteps: ${diffusion.num_timesteps}
+  beta_schedule: ${diffusion.beta_schedule}
+  model_mean_type: ${diffusion.model_mean_type}
+  model_var_type: ${diffusion.model_var_type}
+  loss_type: ${diffusion.loss_type}
+
+
+# Optimizer configuration
+optim:
+  param_group_modifiers: True  # Different LR for LLM and DiT
+
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 1e-5  # Base LR, lower for LLM
+    weight_decay: 0.01
+
+  # Freeze components
+  frozen_module_names:
+    - "*vggt*"  # Freeze VGGT (DINO, Aggregator, DPT Head)
+    - "*autoencoder*"  # Freeze AutoEncoder
+
+  amp:
+    enabled: True
+    amp_dtype: bfloat16
+  
+  gradient_clip:
+    _target_: train_utils.gradient_clip.GradientClipper
+    configs:
+      - module_name: ["llm"]
+        max_norm: 0.5  # Lower for LLM stability
+        norm_type: 2
+      - module_name: ["dit"]
+        max_norm: 1.0
+        norm_type: 2
+      - module_name: ["resampler"]
+        max_norm: 1.0
+        norm_type: 2
+  
+  # Param groups with different learning rates
+  param_groups:
+    - module_name: ["llm"]
+      lr: 1e-5  # Low LR for LLM (LoRA)
+    - module_name: ["dit"]
+      lr: 1e-4  # Higher LR for DiT
+    - module_name: ["visual_resampler", "condition_generator"]
+      lr: 1e-4
+
+  options:
+    lr:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.CompositeParamScheduler
+          schedulers:
+            - _target_: fvcore.common.param_scheduler.LinearParamScheduler
+              start_value: 1e-7
+              end_value: 1e-5
+            - _target_: fvcore.common.param_scheduler.CosineParamScheduler
+              start_value: 1e-5
+              end_value: 1e-7
+          lengths: [0.05, 0.95]
+          interval_scaling: ['rescaled', 'rescaled']
+    weight_decay:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+          value: 0.01
+
+
+max_epochs: 50
+
+
+# Model configuration
+model:
+  # LLM-DiT Wrapper (main model for Phase 3)
+  llm_dit_wrapper:
+    _target_: vggt.models.llm_dit_wrapper.LLMDiTWrapper
+    visual_dim: 1024  # DINO feature dimension
+    llm_dim: ${llm.llm_dim}
+    latent_dim: 512
+    dit_hidden_dim: 1024
+    num_visual_queries: 64
+    num_frames: 16
+    num_patches: 256
+    dit_depth: 12
+
+  # Pretrained DiT from Phase 2
+  dit_pretrained:
+    pretrained_path: /YOUR/PATH/TO/DIT_CKPT
+    load_dit_weights: True
+
+  # Frozen AutoEncoder from Phase 1
+  autoencoder:
+    _target_: vggt.models.latent_autoencoder.LatentAutoEncoder
+    input_dim: 2048
+    num_layers: 4
+    hidden_dim: 1024
+    latent_dim: 512
+    num_encoder_blocks: 4
+    num_decoder_blocks: 4
+    num_heads: 16
+    spatial_downsample: 4
+    intermediate_layer_idx: [4, 11, 17, 23]
+    pretrained_path: /YOUR/PATH/TO/AUTOENCODER_CKPT
+
+  # Frozen VGGT for feature extraction and evaluation
+  vggt:
+    _target_: vggt.models.vggt.VGGT
+    enable_camera: True
+    enable_depth: True
+    enable_point: True
+    enable_track: False
+
+
+distributed:
+  backend: nccl
+  comms_dtype: null
+  find_unused_parameters: True  # Some LLM parameters may be unused
+  timeout_mins: 60  # Longer timeout for LLM
+  gradient_as_bucket_view: True
+  bucket_cap_mb: 25
+  broadcast_buffers: True
+
+
+cuda:
+  cudnn_deterministic: False
+  cudnn_benchmark: False
+  allow_tf32: True
